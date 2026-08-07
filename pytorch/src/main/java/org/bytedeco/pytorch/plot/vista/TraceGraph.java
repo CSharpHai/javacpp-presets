@@ -182,6 +182,38 @@ public final class TraceGraph {
         return out;
     }
 
+    /**
+     * Render the graph as an ASCII flow diagram, similar to:
+     * <pre>
+     * input_user_id -> EmbeddingImpl_3 -┐
+     * input_item_id -> EmbeddingImpl_4 -┤-> cat_6 (2,24) -┬-> LinearImpl_8 (expert_0) -> ReLUImpl_9 -> ...
+     * input_cate_id -> EmbeddingImpl_5 -┘                ├-> LinearImpl_12 (expert_1) -> ...
+     *                                                    └-> LinearImpl_23 (gate) -> ...
+     * </pre>
+     *
+     * <p>The renderer groups inputs by their first downstream consumer so that
+     * fan-in (multiple inputs merging into one node) and fan-out (one node
+     * feeding several children) are both visible. Linear chains are collapsed
+     * onto a single line to keep the diagram compact.
+     */
+    public String toFlowString() {
+        return toFlowString(120);
+    }
+
+    /**
+     * Render the graph as an ASCII flow diagram with a target line width.
+     *
+     * @param maxWidth approximate maximum line width in characters; lines may
+     *                 still exceed this when a single chain is longer than the
+     *                 budget, but the renderer will wrap to a new line at the
+     *                 next fan-out / fan-in boundary.
+     */
+    public String toFlowString(int maxWidth) {
+        if (adjList.isEmpty()) return "(empty graph)";
+        FlowRenderer r = new FlowRenderer(this, maxWidth);
+        return r.render();
+    }
+
     /** Human-readable summary for console / tests. */
     public String summary() {
         StringBuilder sb = new StringBuilder();

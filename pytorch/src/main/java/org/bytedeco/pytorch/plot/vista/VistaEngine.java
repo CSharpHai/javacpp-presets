@@ -4568,6 +4568,12 @@ public final class VistaEngine {
         //      terminal via BFS.
         repairBreakpoints(adj);
 
+        // Cycle repair: detect and break any remaining cycles in the graph.
+        // Cycles arise from tracing artifacts (e.g. tensor-source propagation
+        // creating moe_combine -> container -> moe_combine, or cat(embed) ->
+        // gate -> cat(embed)). We remove the most suspicious edge in each cycle.
+        repairCycles(adj);
+
         // Filter: feature embeddings must NEVER connect directly to output nodes
         // or combining ops (add/cat) that feed output. They should flow through
         // downstream modules (linear/mlp/fm/...) first. Only strip the direct
@@ -4818,6 +4824,190 @@ public final class VistaEngine {
             if (adj.containsKey(t) && !t.equals(start)) return t;
         }
         return null;
+    }
+
+    /**
+     * Detect and repair cycles in the graph. A cycle is a directed path that
+     * returns to its starting node (e.g. A -> B -> C -> A). Cycles break the
+     * DAG invariant assumed by downstream rendering and analysis.
+     *
+     * <p>Strategy:
+     * <ol>
+     *   <li>Iterative DFS with a recursion stack to detect back-edges.</li>
+     *   <li>For each detected cycle, score every edge on the cycle and remove
+     *       the most suspicious one. Suspicion is highest for edges that point
+     *       back to a combining/source node (cat(embed), moe_combine, add,
+     *       container) — these are typical tracing artifacts rather than real
+     *       data flow.</li>
+     *   <li>Repeat until no cycles remain (bounded to avoid infinite loops).</li>
+     * </ol>
+     */
+    private void repairCycles(Map<String, GraphNode> adj) {
+        final int maxIterations = 64;
+        for (int iter = 0; iter < maxIterations; iter++) {
+            List<String> cycle = findCycle(adj);
+            if (cycle == null) {
+                if (iter > 0) {
+                    System.out.println("[vista] cycle-repair: removed " + iter
+                            + " cyclic edge(s) in total");
+                }
+                return;
+            }
+            // cycle is a list of node names [v0, v1, ..., vk] with edges
+            // v0->v1, v1->v2, ..., v(k-1)->vk, vk->v0 forming the cycle.
+            String removed = breakCycle(adj, cycle);
+            if (removed == null) {
+                // Could not pick an edge to remove; bail out to avoid looping.
+                System.out.println("[vista] cycle-repair: unable to break cycle "
+                        + cycle + " — giving up");
+                return;
+            }
+            System.out.println("[vista] cycle-repair: detected cycle "
+                    + String.join(" -> ", cycle) + " -> " + cycle.get(0)
+                    + "; removed edge " + removed);
+        }
+        System.out.println("[vista] cycle-repair: iteration cap reached (" + maxIterations + ")");
+    }
+
+    /**
+     * Find one cycle in the graph via iterative DFS. Returns the cycle as a
+     * list of node names [v0, v1, ..., vk] where v0 is the earliest node on
+     * the recursion stack that is revisited, or null if the graph is acyclic.
+     */
+    private List<String> findCycle(Map<String, GraphNode> adj) {
+        Set<String> visited = new HashSet<>();
+        // Use a deterministic order for reproducibility.
+        List<String> order = new ArrayList<>(adj.keySet());
+        Collections.sort(order);
+        for (String root : order) {
+            if (visited.contains(root)) continue;
+            // Iterative DFS with an explicit stack of child-iterators and a
+            // parallel "current path" stack to detect back-edges.
+            ArrayDeque<String> path = new ArrayDeque<>();
+            Set<String> inStack = new HashSet<>();
+            ArrayDeque<Iterator<String>> frames = new ArrayDeque<>();
+            visited.add(root);
+            inStack.add(root);
+            path.push(root);
+            frames.push(children(adj, root));
+            while (!frames.isEmpty()) {
+                Iterator<String> it = frames.peek();
+                String cur = path.peek();
+                if (it.hasNext()) {
+                    String nxt = it.next();
+                    if (!adj.containsKey(nxt)) continue;
+                    if (inStack.contains(nxt)) {
+                        // Found a back-edge: cur -> nxt, where nxt is on the
+                        // current path. Extract the cycle from the path.
+                        List<String> cycle = new ArrayList<>();
+                        // Walk the path from top until we reach nxt.
+                        ArrayDeque<String> tmp = new ArrayDeque<>();
+                        while (!path.isEmpty() && !path.peek().equals(nxt)) {
+                            tmp.push(path.pop());
+                        }
+                        // path.peek() == nxt (the cycle entry)
+                        cycle.add(nxt);
+                        while (!tmp.isEmpty()) {
+                            cycle.add(tmp.pop());
+                        }
+                        // cycle now = [nxt, ..., cur]; edge cur->nxt closes it
+                        return cycle;
+                    }
+                    if (!visited.contains(nxt)) {
+                        visited.add(nxt);
+                        inStack.add(nxt);
+                        path.push(nxt);
+                        frames.push(children(adj, nxt));
+                    }
+                } else {
+                    // Done with cur — pop frame.
+                    frames.pop();
+                    String done = path.pop();
+                    inStack.remove(done);
+                }
+            }
+        }
+        return null;
+    }
+
+    /** Build a fresh iterator over the live child targets of {@code node}. */
+    private Iterator<String> children(Map<String, GraphNode> adj, String node) {
+        GraphNode n = adj.get(node);
+        if (n == null) return Collections.emptyIterator();
+        List<String> kids = new ArrayList<>(n.edges().size());
+        for (GraphEdge e : n.edges()) {
+            if (adj.containsKey(e.target())) kids.add(e.target());
+        }
+        Collections.sort(kids);
+        return kids.iterator();
+    }
+
+    /**
+     * Remove the most suspicious edge on the given cycle. Returns a string
+     * describing the removed edge ("src -> tgt"), or null if no edge could be
+     * removed (e.g. the cycle is degenerate).
+     */
+    private String breakCycle(Map<String, GraphNode> adj, List<String> cycle) {
+        if (cycle == null || cycle.size() < 1) return null;
+        // Build the list of cycle edges: (cycle[i] -> cycle[i+1]) and the
+        // closing edge (cycle[last] -> cycle[0]).
+        class Edge { final String src; final String tgt; Edge(String s, String t) { src = s; tgt = t; } }
+        List<Edge> edges = new ArrayList<>();
+        for (int i = 0; i < cycle.size(); i++) {
+            String src = cycle.get(i);
+            String tgt = cycle.get((i + 1) % cycle.size());
+            edges.add(new Edge(src, tgt));
+        }
+        // Score each edge; higher = more suspicious = prefer to remove.
+        int bestIdx = -1;
+        int bestScore = Integer.MIN_VALUE;
+        for (int i = 0; i < edges.size(); i++) {
+            Edge e = edges.get(i);
+            int score = cycleEdgeSuspicion(adj, e.src, e.tgt);
+            if (score > bestScore) {
+                bestScore = score;
+                bestIdx = i;
+            }
+        }
+        if (bestIdx < 0) return null;
+        Edge toRemove = edges.get(bestIdx);
+        GraphNode srcNode = adj.get(toRemove.src);
+        if (srcNode == null) return null;
+        boolean removed = srcNode.edges().removeIf(e -> toRemove.tgt.equals(e.target()));
+        return removed ? (toRemove.src + " -> " + toRemove.tgt) : null;
+    }
+
+    /**
+     * Heuristic suspicion score for an edge on a cycle. Edges that point back
+     * to combining/source nodes (cat(embed), moe_combine, add, container) are
+     * most likely tracing artifacts and get the highest scores.
+     */
+    private int cycleEdgeSuspicion(Map<String, GraphNode> adj, String src, String tgt) {
+        int score = 0;
+        String tgtDisp = graph.graphNodeNameToWithoutSuffix().getOrDefault(tgt, tgt).toLowerCase();
+        String tgtFull = graph.graphNodeDisplayNames().getOrDefault(tgt, "");
+        String srcDisp = graph.graphNodeNameToWithoutSuffix().getOrDefault(src, src).toLowerCase();
+        // Target is a combining/source op — high suspicion (these should be
+        // sinks in the data-flow direction, not cycle entry points).
+        if (tgtFull.contains("cat(embed)")) score += 100;
+        if (tgtDisp.contains("moe_combine")) score += 90;
+        if (tgtDisp.startsWith("add")) score += 80;
+        if (tgtDisp.startsWith("cat")) score += 70;
+        if (tgtDisp.contains("container")) score += 60;
+        // Target is an input node — should never be a cycle target.
+        GraphNode tn = adj.get(tgt);
+        if (tn != null && tn.nodeType() == NodeType.INPUT) score += 200;
+        // Source is an output node — outputs shouldn't feed back.
+        GraphNode sn = adj.get(src);
+        if (sn != null && sn.nodeType() == NodeType.OUTPUT) score += 150;
+        // Self-loop is always removed first.
+        if (src.equals(tgt)) score += 1000;
+        // Prefer removing edges from non-embedding sources (embeddings are
+        // real sources; their outgoing edges are usually correct).
+        if (isEmbeddingNodeName(src)) score -= 20;
+        // Tie-breaker: deterministic by name.
+        score -= (src.hashCode() & 0x7) + (tgt.hashCode() & 0x3);
+        return score;
     }
 
     private static void pruneMapKeys(Map<String, ?> map, Set<String> keep) {

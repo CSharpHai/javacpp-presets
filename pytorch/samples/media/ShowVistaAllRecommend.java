@@ -317,6 +317,8 @@ public class ShowVistaAllRecommend {
                         .collapseModulesAfterDepth(1));
                 if (open) opened = true;
                 System.out.println(Vista.summary(g) + " → " + html.getFileName());
+                System.out.println("--- flow ---");
+                System.out.println(Vista.toFlowString(g));
                 int shown = 0;
                 for (String n : g.adjList().keySet()) {
                     if (shown++ >= 6) {

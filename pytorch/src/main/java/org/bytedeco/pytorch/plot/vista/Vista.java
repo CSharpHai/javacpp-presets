@@ -121,6 +121,36 @@ public final class Vista {
         return graph == null ? "null" : graph.summary();
     }
 
+    /**
+     * Render a trace graph as an ASCII flow diagram for console output.
+     *
+     * <p>Example:
+     * <pre>
+     * input_user_id -> EmbeddingImpl_3 -┐
+     * input_item_id -> EmbeddingImpl_4 -┤-> cat_6 (2,24) -┬-> LinearImpl_8 (expert_0) -> ...
+     * input_cate_id -> EmbeddingImpl_5 -┘                └-> LinearImpl_23 (gate) -> ...
+     * </pre>
+     *
+     * @param graph the trace graph to render (may be null)
+     * @return the ASCII flow diagram, or {@code "null"} if graph is null
+     * @see TraceGraph#toFlowString()
+     */
+    public static String toFlowString(TraceGraph graph) {
+        return graph == null ? "null" : graph.toFlowString();
+    }
+
+    /**
+     * Render a trace graph as an ASCII flow diagram with a target line width.
+     *
+     * @param graph     the trace graph to render (may be null)
+     * @param maxWidth  approximate maximum line width in characters
+     * @return the ASCII flow diagram, or {@code "null"} if graph is null
+     * @see TraceGraph#toFlowString(int)
+     */
+    public static String toFlowString(TraceGraph graph, int maxWidth) {
+        return graph == null ? "null" : graph.toFlowString(maxWidth);
+    }
+
     // =========================================================================
     // File / checkpoint API
     // =========================================================================
