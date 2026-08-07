@@ -1640,10 +1640,9 @@ public final class VistaEngine {
             try {
                 real = callForward(m, sparseFeats);
             } catch (Throwable ignored) {
-                System.err.println("[DEBUG expandEmbeddingLayer] callForward FAILED: " + ignored);
+                // callForward may fail on device mismatch; structural expand
+                // below still produces correct topology.
             }
-            System.err.println("[DEBUG expandEmbeddingLayer] module=" + ModuleDiscovery.typeName(m)
-                    + " real=" + (real == null ? "null" : (real.isNull() ? "null(isNull)" : "non-null")));
 
             for (ModuleChildren.NamedChild child : ModuleChildren.list(m)) {
                 Module cm = ModuleDiscovery.concrete(child.module);
@@ -1652,8 +1651,6 @@ public final class VistaEngine {
                 // Find matching feature tensor
                 Tensor idx = null;
                 if (sparseFeats != null) {
-                    System.err.println("[DEBUG expandEmbeddingLayer] child key=" + key + " base=" + base
-                            + " sparseFeats keys=" + sparseFeats.keySet());
                     Object v = sparseFeats.get(base);
                     if (v == null) {
                         // try raw key / without prefix
@@ -1671,27 +1668,18 @@ public final class VistaEngine {
                         idx = (Tensor) v;
                     }
                 }
-                System.err.println("[DEBUG expandEmbeddingLayer] child key=" + key
-                        + " idx=" + (idx == null ? "null" : "non-null")
-                        + " cmType=" + ModuleDiscovery.simpleTypeName(cm)
-                        + " isEmbedding=" + ModuleDiscovery.simpleTypeName(cm).toLowerCase().contains("embedding"));
                 if (idx != null && ModuleDiscovery.simpleTypeName(cm).toLowerCase().contains("embedding")) {
                     try {
                         Tensor out = traceLeafModule(cm, idx, stackDepth + 1);
-                        System.err.println("[DEBUG expandEmbeddingLayer] traceLeafModule for " + key
-                                + " out=" + (out == null ? "null" : (out.isNull() ? "null(isNull)" : "non-null")));
                         if (out != null && !out.isNull()) {
                             parts.add(out);
                             String src = tensorSource.get(TensorUtils.tensorKey(out));
                             if (src != null) partNames.add(src);
                         }
                     } catch (Throwable ex) {
-                        System.err.println("[DEBUG expandEmbeddingLayer] traceLeafModule THREW for " + key
-                                + " err=" + ex.getClass().getSimpleName() + ": " + ex.getMessage());
-                        // traceLeafModule failed (e.g. MPS placeholder storage issue
-                        // after callForward moved tensors to device). Emit a
-                        // structural node and record it for later wiring to the
-                        // real output source (cat node).
+                        // traceLeafModule failed (e.g. device mismatch that
+                        // couldn't be auto-aligned). Emit a structural node and
+                        // record it for later wiring to the real output source.
                         if (!hasRecordedChild(cm)) {
                             String sname = emitStructuralChildReturning(cm, key, stackDepth + 1);
                             if (sname != null) structChildNames.add(sname);
@@ -1711,16 +1699,12 @@ public final class VistaEngine {
                 }
             }
 
-            System.err.println("[DEBUG expandEmbeddingLayer] after loop: parts=" + parts.size()
-                    + " partNames=" + partNames + " structChildNames=" + structChildNames);
-
             if (real != null && !real.isNull()) {
                 // Prefer real forward output for downstream chaining.
                 // Create a proper operation node so downstream modules can
                 // trace edges from it (container frames are not in adjList).
                 long key = TensorUtils.tensorKey(real);
                 String realSource = tensorSource.get(key);
-                System.err.println("[DEBUG expandEmbeddingLayer] real non-null, realSource=" + realSource);
                 if (realSource == null) {
                     int totalCount = partNames.size() + structChildNames.size();
                     if (totalCount <= 1 && !partNames.isEmpty()) {
@@ -1738,8 +1722,6 @@ public final class VistaEngine {
                         graph.nodeToAncestors().put(catName, currentAncestors());
                         tensorSource.put(key, catName);
                         realSource = catName;
-                        System.err.println("[DEBUG expandEmbeddingLayer] CREATED cat node: " + catName
-                                + " totalCount=" + totalCount);
                     }
                 }
                 // Wire edges from each traced EmbeddingImpl part to the real
@@ -1867,6 +1849,50 @@ public final class VistaEngine {
         long[] shape = weight.shape();
         if (shape.length < 2) return -1;
         return shape[1];
+    }
+
+    /**
+     * Determine the device of a module's first parameter (weight), or -1 (CPU)
+     * if it has no parameters. Used to align input tensors before reflective
+     * forward calls so MPS/CPU mismatches don't crash the trace.
+     */
+    private long moduleDeviceId(Module m) {
+        try {
+            org.bytedeco.pytorch.StringTensorDict dict = m.named_parameters(false);
+            if (dict == null || dict.isNull()) return -1;
+            long n = dict.size();
+            for (long i = 0; i < n; i++) {
+                org.bytedeco.pytorch.StringTensorDictItem item = dict.get(i);
+                if (item == null || item.isNull()) continue;
+                Tensor t = item.value();
+                if (t == null || t.isNull()) continue;
+                return t.__dispatch_get_device();
+            }
+        } catch (Throwable ignored) {}
+        return -1;
+    }
+
+    /**
+     * Move a tensor to the given device id (-1 = CPU). Returns the original
+     * tensor if already on that device or if the move fails. Used to align
+     * input tensors with module parameters before reflective forward calls.
+     */
+    private Tensor toDevice(Tensor t, long deviceId) {
+        if (t == null || t.isNull()) return t;
+        try {
+            long cur = t.__dispatch_get_device();
+            if (cur == deviceId) return t;
+            if (deviceId < 0) {
+                return t.cpu();
+            }
+            String devStr = (deviceId == 0) ? "mps" : "cuda:" + deviceId;
+            org.bytedeco.pytorch.Device dev = new org.bytedeco.pytorch.Device(devStr);
+            org.bytedeco.pytorch.TensorOptions opts =
+                    org.bytedeco.pytorch.global.torch.device(dev);
+            return t.to(opts, false, false, new org.bytedeco.pytorch.MemoryFormatOptional());
+        } catch (Throwable ignored) {
+            return t;
+        }
     }
 
     /** Infer the batch size from input node edges in the graph. */
@@ -4268,22 +4294,37 @@ public final class VistaEngine {
         }
         // Built-in *Impl: only use 1-arg (or exact) typed forward. Avoid 3/4-arg
         // shims unless the concrete class actually overrides them.
+        long modDev = moduleDeviceId(m);
         try {
             if (args.length == 1) {
-                return m.forward(args[0]);
+                Tensor aligned = toDevice(args[0], modDev);
+                return m.forward(aligned);
             }
             if (args.length == 2
                     && ModuleAsHelper.hasForwardOverride(m, Tensor.class, Tensor.class)) {
-                return m.forward(args[0], args[1]);
+                Tensor a0 = toDevice(args[0], modDev);
+                Tensor a1 = toDevice(args[1], modDev);
+                return m.forward(a0, a1);
             }
             if (args.length >= 3) {
                 // Multi-tensor without an override → reflective or first tensor only
                 Tensor mapped = invokeReflectiveForward(m, inputs);
                 if (mapped != null) return mapped;
-                return m.forward(args[0]);
+                return m.forward(toDevice(args[0], modDev));
             }
-            return m.forward(args[0]);
+            return m.forward(toDevice(args[0], modDev));
         } catch (RuntimeException e) {
+            // Device mismatch (e.g. MPS placeholder storage on EmbeddingImpl) —
+            // retry on CPU by moving the input tensor to CPU. The module's
+            // parameters stay on their device; PyTorch will either fall back
+            // (PYTORCH_ENABLE_MPS_FALLBACK=1) or we try reflective forward.
+            if (modDev >= 0) {
+                try {
+                    Tensor cpuIn = toDevice(args[0], -1);
+                    Tensor out = m.forward(cpuIn);
+                    if (out != null && !out.isNull()) return out;
+                } catch (Throwable ignored2) {}
+            }
             Tensor mapped = invokeReflectiveForward(m, inputs);
             if (mapped != null) return mapped;
             throw e;
@@ -4360,10 +4401,6 @@ public final class VistaEngine {
             List<Tensor> extracted = TensorUtils.extractTensors(result);
             return extracted.isEmpty() ? null : extracted.get(0);
         } catch (Throwable t) {
-            System.err.println("[DEBUG invokeReflectiveForward] FAILED on " + m.getClass().getName()
-                    + " method=" + (method != null ? method.getName() : "null")
-                    + " params=" + (method != null ? java.util.Arrays.toString(method.getParameterTypes()) : "[]")
-                    + " err=" + t);
             return null;
         }
     }
