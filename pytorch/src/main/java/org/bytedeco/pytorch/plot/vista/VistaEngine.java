@@ -1869,6 +1869,38 @@ public final class VistaEngine {
         return shape[1];
     }
 
+    /** Check if a node is a shape-preserving op (output shape == input shape).
+     *  Used by dims propagation to avoid spreading wrong shapes through
+     *  shape-changing ops like LinearImpl, FM, cat, add. */
+    private boolean isShapePreservingNode(String nodeName) {
+        String typeless = graph.graphNodeNameToWithoutSuffix().get(nodeName);
+        if (typeless == null) return false;
+        // Activation functions — preserve shape
+        if (typeless.equals("ReLUImpl") || typeless.equals("ReLU")
+                || typeless.equals("SigmoidImpl") || typeless.equals("Sigmoid")
+                || typeless.equals("TanhImpl") || typeless.equals("Tanh")
+                || typeless.equals("GELUImpl") || typeless.equals("GELU")
+                || typeless.equals("SiLUImpl") || typeless.equals("SiLU")
+                || typeless.equals("PReLUImpl") || typeless.equals("PReLU")
+                || typeless.equals("LeakyReLUImpl") || typeless.equals("LeakyReLU")
+                || typeless.equals("IdentityImpl") || typeless.equals("Identity")
+                || typeless.equals("ELUImpl") || typeless.equals("ELU")) {
+            return true;
+        }
+        // Dropout — preserves shape
+        if (typeless.equals("FunctionalDropout") || typeless.equals("DropoutImpl")
+                || typeless.equals("Dropout")) {
+            return true;
+        }
+        // Normalization — preserves shape
+        if (typeless.equals("LayerNormImpl") || typeless.equals("LayerNorm")
+                || typeless.equals("BatchNorm1dImpl") || typeless.equals("BatchNorm1d")
+                || typeless.equals("BatchNorm2dImpl") || typeless.equals("BatchNorm2d")) {
+            return true;
+        }
+        return false;
+    }
+
     private Tensor catAlongDim1(List<Tensor> parts, List<String> partNames) {
         Tensor[] arr = parts.toArray(new Tensor[0]);
         org.bytedeco.pytorch.TensorVector tv = new org.bytedeco.pytorch.TensorVector(arr);
@@ -3027,6 +3059,10 @@ public final class VistaEngine {
 
         List<String> outs = new ArrayList<>(outputNodeSet);
         Map<String, String> inDimHint = new HashMap<>();
+        // outDimHint maps a SOURCE node → its output dims (dims on its
+        // outgoing edges). Used by sink-fan-out to set the dims of edges
+        // FROM sinks, which is the sink's OUTPUT shape, not its input shape.
+        Map<String, String> outDimHint = new HashMap<>();
         for (GraphNode n : graph.adjList().values()) {
             for (GraphEdge e : n.edges()) {
                 if (e.dims() != null && !e.dims().isEmpty()) {
@@ -3096,8 +3132,10 @@ public final class VistaEngine {
                     }
                 }
             }
-            // Pass 2: propagate dims through pass-through ops (ReLU, Dropout, etc.)
-            // Iterate until no changes (handles chains like Linear→ReLU→Dropout→Linear)
+            // Pass 2: propagate dims through shape-preserving ops only
+            // (ReLU, Dropout, LayerNorm, etc.). Do NOT propagate through
+            // shape-changing ops like LinearImpl, FM, cat, add, EmbeddingImpl —
+            // these change dimensions and would produce incorrect shapes.
             for (int iter = 0; iter < 10; iter++) {
                 boolean changed = false;
                 // Build incoming dims map
@@ -3109,10 +3147,12 @@ public final class VistaEngine {
                         }
                     }
                 }
-                // Propagate to empty edges
+                // Propagate to empty edges — only for shape-preserving ops
                 for (Map.Entry<String, GraphNode> e : graph.adjList().entrySet()) {
                     String srcName = e.getKey();
                     GraphNode srcNode = e.getValue();
+                    // Check if this node is a shape-preserving op
+                    if (!isShapePreservingNode(srcName)) continue;
                     List<GraphEdge> edges = srcNode.edges();
                     String srcIncoming = incomingDims.get(srcName);
                     if (srcIncoming == null) continue;
@@ -3124,6 +3164,58 @@ public final class VistaEngine {
                     }
                 }
                 if (!changed) break;
+            }
+            // Pass 3: special-case FM nodes — FM always outputs (batch, 1)
+            {
+                long bs = inferredBatch;
+                for (Map.Entry<String, GraphNode> e : graph.adjList().entrySet()) {
+                    String srcName = e.getKey();
+                    String disp = graph.graphNodeDisplayNames().get(srcName);
+                    String typeless = graph.graphNodeNameToWithoutSuffix().get(srcName);
+                    boolean isFM = (disp != null && disp.equals("FM"))
+                            || (typeless != null && typeless.equals("FM"));
+                    if (!isFM) continue;
+                    List<GraphEdge> edges = e.getValue().edges();
+                    String fmDims = bs > 0 ? "(" + bs + ",1)" : "(1)";
+                    for (int i = 0; i < edges.size(); i++) {
+                        GraphEdge ge = edges.get(i);
+                        if (ge.dims() == null || ge.dims().isEmpty()) {
+                            edges.set(i, new GraphEdge(ge.target(), fmDims, ge.edgeDataId(), ge.implied()));
+                        }
+                    }
+                }
+            }
+            // Rebuild inDimHint now that dims have been inferred, so the
+            // sink-fan-out pass below uses the enriched dims instead of "(out)".
+            inDimHint.clear();
+            outDimHint.clear();
+            for (Map.Entry<String, GraphNode> entry : graph.adjList().entrySet()) {
+                String src = entry.getKey();
+                for (GraphEdge e : entry.getValue().edges()) {
+                    if (e.dims() != null && !e.dims().isEmpty()) {
+                        inDimHint.putIfAbsent(e.target(), e.dims());
+                        // Record the source's output dims (first non-empty edge)
+                        outDimHint.putIfAbsent(src, e.dims());
+                    }
+                }
+            }
+            // For sink nodes (no outgoing edges with dims) that have
+            // moduleInfo with a weight, infer output dims from weight shape.
+            // This handles LinearImpl sinks whose edges are created later by
+            // the sink-fan-out pass.
+            if (inferredBatch > 0) {
+                for (Map.Entry<String, GraphNode> entry : graph.adjList().entrySet()) {
+                    String src = entry.getKey();
+                    if (outDimHint.containsKey(src)) continue;
+                    ModuleInfo info = graph.moduleInfo().get(src);
+                    if (info == null || info.parameters() == null) continue;
+                    ModuleInfo.ParamInfo weight = info.parameters().get("weight");
+                    if (weight == null) continue;
+                    long[] shape = weight.shape();
+                    if (shape.length < 2) continue;
+                    long outFeatures = shape[0];
+                    outDimHint.put(src, "(" + inferredBatch + "," + outFeatures + ")");
+                }
             }
         }
 
@@ -3547,24 +3639,32 @@ public final class VistaEngine {
             String primaryOut = outs.get(0);
             for (String sink : sinks) {
                 GraphNode node = graph.adjList().get(sink);
-                String dims = inDimHint.getOrDefault(sink, "(out)");
+                // Use outDimHint (sink's OUTPUT shape) not inDimHint (input shape)
+                String dims = outDimHint.getOrDefault(sink,
+                        inDimHint.getOrDefault(sink, "(out)"));
                 node.addEdge(new GraphEdge(combineOpName, dims));
             }
-            combineNode.addEdge(new GraphEdge(primaryOut, "(out)"));
+            // add combine op output dims = first sink's output dims
+            // (add preserves shape when inputs match).
+            String combineOutDims = outDimHint.getOrDefault(sinks.get(0),
+                    inDimHint.getOrDefault(sinks.get(0), "(out)"));
+            combineNode.addEdge(new GraphEdge(primaryOut, combineOutDims));
         } else if (!sinks.isEmpty()) {
             // Pair sinks to outputs by index when counts match; else fan-in all sinks → all outs
             if (sinks.size() == outs.size()) {
                 for (int i = 0; i < sinks.size(); i++) {
                     GraphNode node = graph.adjList().get(sinks.get(i));
-                    String dims = inDimHint.getOrDefault(sinks.get(i),
-                            metaShape(outs.get(i), "(out)"));
+                    String dims = outDimHint.getOrDefault(sinks.get(i),
+                            inDimHint.getOrDefault(sinks.get(i),
+                                    metaShape(outs.get(i), "(out)")));
                     node.addEdge(new GraphEdge(outs.get(i), dims));
                 }
             } else if (outs.size() == 1) {
                 String primaryOut = outs.get(0);
                 for (String sink : sinks) {
                     GraphNode node = graph.adjList().get(sink);
-                    String dims = inDimHint.getOrDefault(sink, "(out)");
+                    String dims = outDimHint.getOrDefault(sink,
+                            inDimHint.getOrDefault(sink, "(out)"));
                     node.addEdge(new GraphEdge(primaryOut, dims));
                 }
             } else {
@@ -3572,7 +3672,8 @@ public final class VistaEngine {
                 for (int i = 0; i < sinks.size(); i++) {
                     GraphNode node = graph.adjList().get(sinks.get(i));
                     String target = outs.get(i % outs.size());
-                    String dims = inDimHint.getOrDefault(sinks.get(i), metaShape(target, "(out)"));
+                    String dims = outDimHint.getOrDefault(sinks.get(i),
+                            inDimHint.getOrDefault(sinks.get(i), metaShape(target, "(out)")));
                     node.addEdge(new GraphEdge(target, dims));
                 }
             }
@@ -3680,9 +3781,14 @@ public final class VistaEngine {
                 GraphNode sn = graph.adjList().get(src);
                 if (sn == null) continue;
                 sn.edges().removeIf(ge -> outName.equals(ge.target()));
-                sn.addEdge(new GraphEdge(combineName, "(out)"));
+                String srcDims = outDimHint.getOrDefault(src,
+                        inDimHint.getOrDefault(src, "(out)"));
+                sn.addEdge(new GraphEdge(combineName, srcDims));
             }
-            combineNode.addEdge(new GraphEdge(outName, "(out)"));
+            String combineOutDims2 = incoming.isEmpty() ? "(out)"
+                    : outDimHint.getOrDefault(incoming.get(0),
+                            inDimHint.getOrDefault(incoming.get(0), "(out)"));
+            combineNode.addEdge(new GraphEdge(outName, combineOutDims2));
         }
     }
 
