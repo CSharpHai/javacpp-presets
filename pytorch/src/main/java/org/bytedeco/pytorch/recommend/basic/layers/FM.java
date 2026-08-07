@@ -50,6 +50,11 @@ public class FM extends Module {
     @Override
     public Tensor forward(Tensor embeddings) {
         // embeddings: (batch_size, num_fields, embed_dim)
+        // If 2D (batch_size, num_fields * embed_dim), reshape to 3D.
+        if (embeddings.dim() == 2) {
+            long batchSize = embeddings.size(0);
+            embeddings = embeddings.view(batchSize, -1, embedDim);
+        }
         // First order: sum of embeddings
         Tensor firstOrder = embeddings.sum(1); // (batch_size, embed_dim)
 

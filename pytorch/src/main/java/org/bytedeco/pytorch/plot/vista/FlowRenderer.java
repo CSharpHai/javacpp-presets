@@ -116,10 +116,54 @@ final class FlowRenderer {
         }
         Collections.sort(leftover);
         for (String n : leftover) {
+            List<String> preds = reverse.getOrDefault(n, Collections.emptyList());
             if (out.length() > 0) out.append('\n');
-            renderFrom(out, n, 0);
+            if (preds.size() > 1) {
+                // Fan-in / merge node whose predecessors were already rendered
+                // as part of other fan-out groups. Render it as a merge
+                // continuation: show the node with a back-reference to its
+                // already-rendered inputs, then render its fan-out below.
+                renderLeftoverMerge(out, n);
+            } else {
+                renderFrom(out, n, 0);
+            }
         }
         return out.toString();
+    }
+
+    /**
+     * Render a leftover fan-in / merge node whose predecessors have already
+     * been rendered elsewhere. Emits the node label with a
+     * {@code <= [pred1, pred2]} back-reference so the reader can see where
+     * the inputs come from, then renders the node's fan-out below.
+     */
+    private void renderLeftoverMerge(StringBuilder out, String node) {
+        List<String> preds = reverse.getOrDefault(node, Collections.emptyList());
+        StringBuilder predLabels = new StringBuilder();
+        for (int i = 0; i < preds.size(); i++) {
+            if (i > 0) predLabels.append(", ");
+            predLabels.append(shortLabel(preds.get(i)));
+        }
+        out.append(nodeLabel(node)).append(" <= [").append(predLabels).append("]");
+        rendered.add(node);
+        List<String> kids = forward.getOrDefault(node, Collections.emptyList());
+        if (kids.size() > 1) {
+            renderFanOut(out, node, 0);
+        } else if (kids.size() == 1) {
+            out.append(CHAIN).append(renderLinearChain(kids.get(0)));
+            renderDownstream(out, kids.get(0), 0);
+        }
+    }
+
+    /** Short label without dims — used in merge back-references. */
+    private String shortLabel(String name) {
+        String display = graph.graphNodeDisplayNames().getOrDefault(name, name);
+        String attr = graph.nodeToAttrName().get(name);
+        if (attr != null && !attr.isEmpty() && !attr.equals(display)
+                && !attr.equals(name)) {
+            return display + " (" + attr + ")";
+        }
+        return display == null || display.isEmpty() ? name : display;
     }
 
     /** Collect source nodes: INPUT-type first, then any zero-indegree node. */

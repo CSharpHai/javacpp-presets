@@ -54,6 +54,10 @@ public final class VistaEngine {
     private final Map<Long, String> tensorSource = new HashMap<>();
     private final Map<Long, Boolean> tensorImplied = new HashMap<>();
     private final Set<String> seenEdges = new HashSet<>();
+    /** Node name → runtime output dims (from successful traceOp). Used by
+     *  sink-fan-out to set correct output dims on synthesized combine edges
+     *  when the node has no outgoing edges yet (e.g. FM before add wiring). */
+    private final Map<String, String> runtimeOutputDims = new HashMap<>();
     /** Module identity → structural cat(embed) node created when runtime
      *  forward failed (e.g. MPS device). Used by post-processing to wire
      *  downstream modules to the cat node. */
@@ -2769,6 +2773,12 @@ public final class VistaEngine {
                 tensorImplied.remove(key);
             }
         }
+        // Record runtime output dims so sink-fan-out can use the real output
+        // shape (not the input shape) when wiring combine edges later.
+        if (!outputTensors.isEmpty()) {
+            runtimeOutputDims.putIfAbsent(opName,
+                    TensorUtils.formatDims(outputTensors.get(0)));
+        }
     }
 
     /**
@@ -3249,6 +3259,13 @@ public final class VistaEngine {
                         // Record the source's output dims (first non-empty edge)
                         outDimHint.putIfAbsent(src, e.dims());
                     }
+                }
+                // Prefer runtime output dims (from successful traceOp) over
+                // edge-derived dims — this is the true output shape even when
+                // the node has no outgoing edges yet (e.g. FM before add wiring).
+                String rtDims = runtimeOutputDims.get(src);
+                if (rtDims != null && !rtDims.isEmpty()) {
+                    outDimHint.put(src, rtDims);
                 }
             }
             // For sink nodes (no outgoing edges with dims) that have
@@ -3737,10 +3754,8 @@ public final class VistaEngine {
         {
             Set<String> catEmbedNodes = new LinkedHashSet<>();
             for (String name : graph.adjList().keySet()) {
-                String disp = graph.graphNodeDisplayNames().get(name);String typeless = graph.graphNodeNameToWithoutSuffix().get(name);
-                if ((disp != null && disp.contains("cat(embed)"))
-                        || (typeless != null && typeless.equals("cat")
-                                && name.startsWith("cat_"))) {
+                String disp = graph.graphNodeDisplayNames().get(name);
+                if (disp != null && disp.contains("cat(embed)")) {
                     catEmbedNodes.add(name);
                 }
             }
