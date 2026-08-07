@@ -1869,6 +1869,21 @@ public final class VistaEngine {
         return shape[1];
     }
 
+    /** Infer the batch size from input node edges in the graph. */
+    private static long inferredBatchSize(TraceGraph graph) {
+        for (Map.Entry<String, GraphNode> e : graph.adjList().entrySet()) {
+            if (!e.getKey().startsWith("input_")) continue;
+            for (GraphEdge ge : e.getValue().edges()) {
+                if (ge.dims() != null && !ge.dims().isEmpty()) {
+                    String d = ge.dims().replaceAll("[()\\s]", "");
+                    String[] parts = d.split(",");
+                    try { return Long.parseLong(parts[0]); } catch (NumberFormatException ignored) {}
+                }
+            }
+        }
+        return -1;
+    }
+
     /** Check if a node is a shape-preserving op (output shape == input shape).
      *  Used by dims propagation to avoid spreading wrong shapes through
      *  shape-changing ops like LinearImpl, FM, cat, add. */
@@ -3075,17 +3090,28 @@ public final class VistaEngine {
         // siblings — they model the concatenation that happens inside
         // feature-embedding modules whose forward expects a Map input (which
         // we cannot trace with Tensor[]).
+        // Prefer structural cat(embed) nodes as the downstream target —
+        // scanning EmbeddingImpl edges can pick up wrong targets (e.g. a
+        // gate's last ReLU) created by functional-op tracing artifacts.
         String embedDownstream = null;
-        for (Map.Entry<String, GraphNode> e : graph.adjList().entrySet()) {
-            String name = e.getKey();
-            if (!name.contains("EmbeddingImpl")) continue;
-            GraphNode node = e.getValue();
-            if (!node.edges().isEmpty()) {
-                for (GraphEdge edge : node.edges()) {
-                    String tgt = edge.target();
-                    if (!tgt.equals("output") && !tgt.contains("output")
-                            && graph.adjList().containsKey(tgt)) {
-                        if (embedDownstream == null) embedDownstream = tgt;
+        for (String cn : structuralEmbeddingCatNodes.values()) {
+            if (cn != null && graph.adjList().containsKey(cn)) {
+                embedDownstream = cn;
+                break;
+            }
+        }
+        if (embedDownstream == null) {
+            for (Map.Entry<String, GraphNode> e : graph.adjList().entrySet()) {
+                String name = e.getKey();
+                if (!name.contains("EmbeddingImpl")) continue;
+                GraphNode node = e.getValue();
+                if (!node.edges().isEmpty()) {
+                    for (GraphEdge edge : node.edges()) {
+                        String tgt = edge.target();
+                        if (!tgt.equals("output") && !tgt.contains("output")
+                                && graph.adjList().containsKey(tgt)) {
+                            if (embedDownstream == null) embedDownstream = tgt;
+                        }
                     }
                 }
             }
@@ -3612,6 +3638,61 @@ public final class VistaEngine {
             // are intermediate (they produce weights, not final outputs).
             if (towerSinks.isEmpty() && predictLayerSinks.isEmpty()) {
                 sinks.addAll(gateSinks);
+            }
+        }
+
+        // Cycle-breaking & embedding rewire: functional ops (torch.mul, torch.cat)
+        // in MoE forwards can create spurious edges TO cat(embed) nodes from
+        // non-embedding layers (e.g. gate's last ReLU → cat_6), forming cycles
+        // like cat_6 → gate_linear → gate_relu → cat_6. Remove those edges and
+        // ensure EmbeddingImpl nodes connect to cat(embed), not to random
+        // downstream layers.
+        {
+            Set<String> catEmbedNodes = new LinkedHashSet<>();
+            for (String name : graph.adjList().keySet()) {
+                String disp = graph.graphNodeDisplayNames().get(name);
+                if (disp != null && disp.contains("cat(embed)")) {
+                    catEmbedNodes.add(name);
+                }
+            }
+            // Break cycles: remove edges TO cat(embed) from non-EmbeddingImpl nodes
+            for (String catName : catEmbedNodes) {
+                for (Map.Entry<String, GraphNode> e : graph.adjList().entrySet()) {
+                    String src = e.getKey();
+                    if (src.contains("EmbeddingImpl")) continue;
+                    if (src.equals(catName)) continue;
+                    e.getValue().edges().removeIf(ge -> catName.equals(ge.target()));
+                }
+            }
+            // Rewire EmbeddingImpl → cat(embed): remove wrong edges to non-cat
+            // nodes and connect to the primary cat(embed) node.
+            if (!catEmbedNodes.isEmpty()) {
+                String primaryCat = catEmbedNodes.iterator().next();
+                for (Map.Entry<String, GraphNode> e : graph.adjList().entrySet()) {
+                    String name = e.getKey();
+                    if (!name.contains("EmbeddingImpl")) continue;
+                    GraphNode node = e.getValue();
+                    node.edges().removeIf(ge -> !catEmbedNodes.contains(ge.target())
+                            && graph.adjList().containsKey(ge.target()));
+                    boolean hasCatEdge = false;
+                    for (GraphEdge ge : node.edges()) {
+                        if (primaryCat.equals(ge.target())) { hasCatEdge = true; break; }
+                    }
+                    if (!hasCatEdge) {
+                        String dims = "";
+                        ModuleInfo info = graph.moduleInfo().get(name);
+                        if (info != null && info.parameters() != null) {
+                            ModuleInfo.ParamInfo w = info.parameters().get("weight");
+                            if (w != null && w.shape().length >= 2) {
+                                long bs = inferredBatchSize(graph);
+                                long embDim = w.shape()[1];
+                                if (bs > 0) dims = "(" + bs + "," + embDim + ")";
+                                else dims = "(1," + embDim + ")";
+                            }
+                        }
+                        node.addEdge(new GraphEdge(primaryCat, dims, 0L, false));
+                    }
+                }
             }
         }
 
