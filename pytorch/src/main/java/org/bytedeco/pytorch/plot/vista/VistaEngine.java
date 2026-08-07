@@ -3337,6 +3337,40 @@ public final class VistaEngine {
             }
         }
 
+        // Pre-pass: expert/gate nodes whose only outgoing edges are to
+        // output nodes or combining ops (cat/add/moe_combine) are artifacts
+        // of functional-op tracing (torch.cat/torch.mul in MoE forwards
+        // propagate the last expert's tensor source to the final output).
+        // Strip those spurious edges so the nodes become real sinks and
+        // get correctly wired to moe_combine by the MoE pass below.
+        {
+            Set<String> spuriousTargets = new HashSet<>(outputNodeSet);
+            for (String n : graph.adjList().keySet()) {
+                String d = graph.graphNodeNameToWithoutSuffix().getOrDefault(n, n).toLowerCase();
+                if (d.startsWith("cat") || d.startsWith("add") || d.contains("moe_combine")) {
+                    spuriousTargets.add(n);
+                }
+            }
+            for (Map.Entry<String, GraphNode> e : graph.adjList().entrySet()) {
+                String name = e.getKey();
+                String attr = graph.nodeToAttrName().get(name);
+                String attrL = attr == null ? "" : attr.toLowerCase();
+                if (!attrL.contains("expert") && !attrL.contains("gate")) continue;
+                GraphNode node = e.getValue();
+                boolean hasRealDownstream = false;
+                for (GraphEdge edge : node.edges()) {
+                    if (!spuriousTargets.contains(edge.target())
+                            && graph.adjList().containsKey(edge.target())) {
+                        hasRealDownstream = true;
+                        break;
+                    }
+                }
+                if (!hasRealDownstream) {
+                    node.edges().removeIf(ge -> spuriousTargets.contains(ge.target()));
+                }
+            }
+        }
+
         // Collect sinks (modules with no outgoing edges to existing nodes)
         // Also classify sinks by their attr-name role for combining-op detection.
         List<String> sinks = new ArrayList<>();
@@ -3527,6 +3561,33 @@ public final class VistaEngine {
             // Gate is no longer a sink — it feeds moe_combine
             gateSinks.clear();
 
+            // After tower-head cleanup, some expert nodes may have lost their
+            // spurious edges to tower heads and become new sinks. Wire them
+            // to ALL moe_combine nodes so they participate in the mixture.
+            for (Map.Entry<String, GraphNode> e : graph.adjList().entrySet()) {
+                String name = e.getKey();
+                String attr = graph.nodeToAttrName().get(name);
+                String attrL = attr == null ? "" : attr.toLowerCase();
+                if (!attrL.contains("expert")) continue;
+                GraphNode node = e.getValue();
+                boolean hasRealEdge = false;
+                for (GraphEdge edge : node.edges()) {
+                    if (graph.adjList().containsKey(edge.target())) {
+                        hasRealEdge = true;
+                        break;
+                    }
+                }
+                if (!hasRealEdge) {
+                    // Wire this orphaned expert to all moe_combine nodes
+                    for (String mc : new ArrayList<>(graph.adjList().keySet())) {
+                        String mcDisp = graph.graphNodeNameToWithoutSuffix().getOrDefault(mc, "");
+                        if ("moe_combine".equals(mcDisp)) {
+                            node.addEdge(new GraphEdge(mc, "", 0L, true));
+                        }
+                    }
+                }
+            }
+
             // Re-collect sinks after wiring experts/gate → moe_combine → towers
             sinks.removeIf(s -> {
                 GraphNode n = graph.adjList().get(s);
@@ -3650,8 +3711,10 @@ public final class VistaEngine {
         {
             Set<String> catEmbedNodes = new LinkedHashSet<>();
             for (String name : graph.adjList().keySet()) {
-                String disp = graph.graphNodeDisplayNames().get(name);
-                if (disp != null && disp.contains("cat(embed)")) {
+                String disp = graph.graphNodeDisplayNames().get(name);String typeless = graph.graphNodeNameToWithoutSuffix().get(name);
+                if ((disp != null && disp.contains("cat(embed)"))
+                        || (typeless != null && typeless.equals("cat")
+                                && name.startsWith("cat_"))) {
                     catEmbedNodes.add(name);
                 }
             }
@@ -4572,10 +4635,16 @@ public final class VistaEngine {
      */
     private void repairBreakpoints(Map<String, GraphNode> adj) {
         // Collect output nodes and combining ops (add_/cat_/moe_combine_/ait_out_)
+        // Exclude cat(embed) nodes — they are embedding concatenation sources,
+        // not combining ops for task outputs. Wiring breakpoints to cat(embed)
+        // creates cycles (e.g. gate_relu → cat_6 → gate_linear → gate_relu).
         Set<String> terminalTargets = new HashSet<>(outputNodeSet);
         Set<String> combiningOps = new HashSet<>();
         for (String n : adj.keySet()) {
             String display = graph.graphNodeNameToWithoutSuffix().getOrDefault(n, n).toLowerCase();
+            String fullDisp = graph.graphNodeDisplayNames().getOrDefault(n, "");
+            // Skip cat(embed) — it's an embedding source, not a combining op
+            if (fullDisp.contains("cat(embed)")) continue;
             if (display.startsWith("add") || display.startsWith("cat")
                     || display.contains("moe_combine") || display.contains("ait_out")
                     || display.contains("output_op") || n.startsWith("output_op_")) {

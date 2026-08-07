@@ -131,7 +131,10 @@ public class MLPBlock extends Module {
                 prevDim = dim;
             }
         }
-        addModule(new LinearImpl(prevDim, outputDim));
+        if (outputLayer || hiddenDims == null || hiddenDims.length == 0) {
+            addModule(new LinearImpl(prevDim, outputDim));
+        }
+//        addModule(new LinearImpl(prevDim, outputDim));
         // Register so parameters() sees Linear weights (Scala omitted this).
         register_module("sequential", sequential);
 
