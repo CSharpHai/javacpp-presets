@@ -31,7 +31,7 @@ import java.util.Objects;
  * Reflection helper that locates {@code forward(Tensor)} on a {@link Module}
  * subclass hierarchy and invokes it. Caches the resolved {@link Method}.
  */
-public final class ModuleForward {
+public class ModuleForward {
     private final Method forwardMethod;
 
     private ModuleForward(Method forwardMethod) {
