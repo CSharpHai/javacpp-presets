@@ -25,6 +25,7 @@ package org.bytedeco.pytorch.distributed;
 import org.bytedeco.pytorch.Scalar;
 import org.bytedeco.pytorch.global.torch;
 import org.bytedeco.pytorch.nn.modules.*;
+import org.bytedeco.pytorch.nn.modules.container.ModuleListImpl;
 import org.bytedeco.pytorch.optim.*;
 
 import org.bytedeco.javacpp.Loader;
@@ -420,9 +421,12 @@ public final class ParallelLayers {
      */
     public static final class RoutedExpertEP extends Module {
         private final LinearImpl router;
-        private final List<LinearImpl> expertGates;
-        private final List<LinearImpl> expertUps;
-        private final List<LinearImpl> expertDowns;
+//        private final List<LinearImpl> expertGates;
+//        private final List<LinearImpl> expertUps;
+//        private final List<LinearImpl> expertDowns;
+        private final ModuleListImpl expertGates;
+        private final ModuleListImpl expertUps;
+        private final ModuleListImpl expertDowns;
         private final ProcessGroupWrapper epGroup;
         private final DeviceMesh epMesh;
         private final int numExperts;
@@ -452,17 +456,17 @@ public final class ParallelLayers {
             this.router = register_module("router", new LinearImpl(hiddenDim, numExperts));
 
             // Local experts (each EP rank owns a subset)
-            this.expertGates = new java.util.ArrayList<>();
-            this.expertUps = new java.util.ArrayList<>();
-            this.expertDowns = new java.util.ArrayList<>();
+            this.expertGates = new ModuleListImpl();
+            this.expertUps = new ModuleListImpl();
+            this.expertDowns = new ModuleListImpl();
             for (int i = 0; i < localExperts; i++) {
                 String prefix = "expert_" + i + "_";
                 LinearImpl gate = register_module(prefix + "gate", new LinearImpl(hiddenDim, hiddenDim * 4));
                 LinearImpl up = register_module(prefix + "up", new LinearImpl(hiddenDim, hiddenDim * 4));
                 LinearImpl down = register_module(prefix + "down", new LinearImpl(hiddenDim * 4, hiddenDim));
-                expertGates.add(gate);
-                expertUps.add(up);
-                expertDowns.add(down);
+                expertGates.push_back(gate);
+                expertUps.push_back(up);
+                expertDowns.push_back(down);
             }
         }
 
@@ -494,35 +498,35 @@ public final class ParallelLayers {
 
             // Simplified: each expert computes on all tokens, weighted by routing
             // Production would use all-to-all to properly route tokens to experts
-            List<Tensor> expertOutputs = new java.util.ArrayList<>();
-            List<Tensor> expertWeights = new java.util.ArrayList<>();
+            TensorVector expertOutputs = new TensorVector();
+            TensorVector expertWeights = new TensorVector();
 
             for (int le = 0; le < localExperts; le++) {
                 int expertId = le * epSize + epRank;
 
                 // Simplified: compute contribution for tokens routed to this expert
-                LinearImpl gate = expertGates.get(le);
-                LinearImpl up = expertUps.get(le);
-                LinearImpl down = expertDowns.get(le);
+                var gate = expertGates.get(le);
+                var up = expertUps.get(le);
+                var down = expertDowns.get(le);
 
                 Tensor gateOut = torch.gelu(gate.forward(x));
                 Tensor upOut = up.forward(x);
                 Tensor expertOut = down.forward(gateOut.mul(upOut));
 
-                expertOutputs.add(expertOut);
-                expertWeights.add(topkVals);
+                expertOutputs.push_back(expertOut);
+                expertWeights.push_back(topkVals);
             }
 
             // Stack and reduce: weighted sum of expert outputs
             // Production would use all-to-all to properly route
-            if (expertOutputs.isEmpty()) {
+            if (expertOutputs.isNull()) {
                 return zeros(batch, seq, hidden).to(x.device(), x.scalar_type());
             }
 
-            Tensor[] outs = expertOutputs.toArray(new Tensor[0]);
-            Tensor stacked = stack(new TensorVector(outs), 0);  // [localExperts, batch, seq, hidden]
-            Tensor[] wts = expertWeights.toArray(new Tensor[0]);
-            Tensor weightStack = stack(new TensorVector(wts), 0);  // [localExperts, batch, seq, topK]
+//            Tensor[] outs = expertOutputs.toArray(new Tensor[0]);
+            Tensor stacked = stack(expertOutputs, 0);  // [localExperts, batch, seq, hidden]
+//            Tensor[] wts = expertWeights.toArray(new Tensor[0]);
+            Tensor weightStack = stack(expertWeights, 0);  // [localExperts, batch, seq, topK]
 
             // Weighted average (simplified)
             Tensor result = stacked.sum(0);
